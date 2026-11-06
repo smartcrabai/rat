@@ -103,7 +103,7 @@ cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Formal specification checks require Node.js 18 or later and Java 17 or later. The Quint version is pinned in `package-lock.json`.
+Formal specification checks require Node.js 18 or later and Java 21 or later. The Quint version is pinned in `package-lock.json`.
 
 ```sh
 npm ci
