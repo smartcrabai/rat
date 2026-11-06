@@ -31,10 +31,10 @@ clap = { version = "4", features = ["derive"] }
 croner = "4"
 iana-time-zone = "0.1"
 libc = "0.2"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
