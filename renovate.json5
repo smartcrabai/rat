@@ -22,10 +22,29 @@
       groupSlug: "all-minor-patch-digest-updates",
     },
     {
+      matchUpdateTypes: [
+        "major"
+      ],
+      prBodyNotes: [
+        "<!-- renovate-major-update -->"
+      ],
+    },
+    {
       matchManagers: [
         "github-actions"
       ],
       minimumReleaseAge: "7 days"
+    },
+    {
+      // digest/pinDigest updates have no releaseTimestamp, so minimumReleaseAge
+      // (with the default minimumReleaseAgeBehaviour "timestamp-required") keeps
+      // renovate/stability-days pending forever. Must stay last to override the
+      // github-actions rule above.
+      matchUpdateTypes: [
+        "digest",
+        "pinDigest"
+      ],
+      minimumReleaseAge: null,
     }
   ]
 }
