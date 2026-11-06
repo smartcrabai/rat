@@ -1,35 +1,52 @@
 [package]
-name = "rat"
-version = "0.1.0"
+description = "Local command scheduling with explicit recovery of uncertain executions"
 edition = "2024"
-repository = "https://github.com/smartcrabai/rat"
-description = ""
 license = "MIT"
+name = "rat"
+repository = "https://github.com/smartcrabai/rat"
+version = "0.1.0"
+
+[workspace.metadata.dist]
+allow-dirty = ["ci"]
+cargo-dist-version = "0.32.0"
+ci = "github"
+install-path = "CARGO_HOME"
+installers = ["shell", "homebrew"]
+publish-jobs = ["homebrew"]
+tap = "smartcrabai/homebrew-tap"
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]
 
 [dependencies]
-tokio = { version = "1.54.1", features = ["rt", "macros"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+croner = "4"
+iana-time-zone = "0.1"
+libc = "0.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1
 lto = true
 strip = true
 
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-expect_used = "deny"
-allow_attributes = "deny"
-dbg_macro = "deny"
-
-[workspace.metadata.dist]
-allow-dirty = ["ci"]
-cargo-dist-version = "0.32.0"
-ci = "github"
-installers = ["shell", "homebrew"]
-targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
-publish-jobs = ["homebrew"]
-install-path = "CARGO_HOME"
-tap = "smartcrabai/homebrew-tap"
-
 [profile.dist]
 inherits = "release"
+
+[lints.clippy]
+allow_attributes = "deny"
+dbg_macro = "deny"
+expect_used = "deny"
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"

@@ -7,14 +7,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-
-
-      - name: Install taplo
+      - name: Install taplo (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           if ! command -v taplo &> /dev/null; then
@@ -23,10 +25,12 @@ jobs:
           fi
 
       - name: Lint Cargo.toml
+        if: runner.os == 'Linux'
         shell: bash
         run: taplo lint Cargo.toml
 
       - name: Check Cargo.toml formatting
+        if: runner.os == 'Linux'
         shell: bash
         run: taplo fmt --check --option reorder_keys=true Cargo.toml
 
@@ -41,14 +45,65 @@ jobs:
         shell: bash
         run: cargo test --all-features
 
+      - name: Install Bats
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install --yes bats
+          else
+            brew install bats-core
+          fi
+
+      - name: Build CLI for E2E tests
+        shell: bash
+        run: cargo build --bin rat
+
+      - name: Run Bats E2E tests
+        shell: bash
+        run: bats tests/e2e.bats
+
       - name: Run clippy
         shell: bash
         run: cargo clippy --all-targets --all-features -- -D warnings
+  formal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Quint
+        run: npm ci
+
+      - name: Typecheck scheduler model
+        run: npm run typecheck
+
+      - name: Run scheduler scenario tests
+        run: npm test
+
+      - name: Simulate scheduler model
+        run: npm run run
+
+      - name: Bounded scheduler verification
+        run: npm run verify
+
 
 
   automerge:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, formal]
     if: github.event.pull_request.user.login == 'renovate[bot]'
     permissions:
       contents: write
