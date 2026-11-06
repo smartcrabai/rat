@@ -2,9 +2,29 @@
 
 rat is a single-user tool for scheduling local shell commands. It targets macOS and Linux and manages one-shot and calendar-based recurring schedules as Jobs.
 
-## Build and install
+## Install
 
-A Rust toolchain and a C compiler are required. SQLite is bundled into the binary.
+Prebuilt binaries support Apple Silicon macOS and Linux x86_64/ARM64 with glibc 2.35 or later. SQLite is bundled.
+
+### Homebrew
+
+```sh
+brew install smartcrabai/tap/rat
+```
+
+### Shell installer
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/smartcrabai/rat/releases/latest/download/rat-installer.sh | sh
+```
+
+The installer uses `$CARGO_HOME/bin` (default: `~/.cargo/bin`). Follow its instructions to update `PATH`, or open a new shell.
+
+Run `rat --help` to check the installation. Versioned downloads and checksums are available on [GitHub Releases](https://github.com/smartcrabai/rat/releases).
+
+### Build from source
+
+A Rust toolchain and a C compiler are required.
 
 ```sh
 cargo install --path .
