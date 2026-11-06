@@ -1,0 +1,13 @@
+{
+  "name": "rat-formal-spec",
+  "private": true,
+  "scripts": {
+    "typecheck": "quint typecheck spec/scheduler.qnt",
+    "test": "quint test spec/scheduler.qnt --seed=211",
+    "run": "quint run spec/scheduler.qnt --invariant=schedulerSafety --max-steps=20 --max-samples=10000 --seed=211",
+    "verify": "quint verify spec/scheduler.qnt --backend=tlc --invariant=schedulerSafety --max-steps=12"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.33.1"
+  }
+}
