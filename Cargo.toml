@@ -1,0 +1,35 @@
+[package]
+name = "rat"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/smartcrabai/rat"
+description = ""
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.54.1", features = ["rt", "macros"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+
+[workspace.metadata.dist]
+allow-dirty = ["ci"]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
+publish-jobs = ["homebrew"]
+install-path = "CARGO_HOME"
+tap = "smartcrabai/homebrew-tap"
+
+[profile.dist]
+inherits = "release"
