@@ -796,13 +796,13 @@ pub fn run(root: &Path, once: bool) -> Result<()> {
     }
 }
 
-struct SignalRegistrations {
+pub(crate) struct SignalRegistrations {
     interrupt: signal_hook::SigId,
     terminate: signal_hook::SigId,
 }
 
 impl SignalRegistrations {
-    fn install(stopping: Arc<AtomicBool>) -> Result<Self> {
+    pub(crate) fn install(stopping: Arc<AtomicBool>) -> Result<Self> {
         let interrupt = flag::register(SIGINT, Arc::clone(&stopping))?;
         match flag::register(SIGTERM, stopping) {
             Ok(terminate) => Ok(Self {

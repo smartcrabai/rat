@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Output;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::thread;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -35,25 +39,52 @@ pub fn data_root() -> Result<PathBuf> {
 
 /// Install rat's login service only after the caller has obtained explicit consent.
 ///
+/// After platform activation, this waits up to five seconds for the scheduler to acquire
+/// its lock.
+///
 /// # Errors
 ///
-/// Returns an error when the platform service manager is unavailable or installation fails.
+/// Returns an error when the platform service manager is unavailable, installation or
+/// activation fails, or the scheduler does not become ready within five seconds. On a
+/// startup timeout, the service configuration remains installed.
 pub fn install(root: &Path) -> Result<()> {
     let root = make_absolute(root.to_path_buf())?;
     let executable = env::current_exe().context("cannot determine the rat executable path")?;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        install_launch_agent(&root, &executable)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        install_systemd_user_service(&root, &executable)
+        #[cfg(target_os = "macos")]
+        install_launch_agent(&root, &executable)?;
+        #[cfg(target_os = "linux")]
+        install_systemd_user_service(&root, &executable)?;
+        wait_for_scheduler(&root)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (root, executable);
         bail!("rat service installation is supported only on macOS and Linux")
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_for_scheduler(root: &Path) -> Result<()> {
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let ready = crate::runner::scheduler_available(root);
+        if ready && Instant::now() < deadline {
+            return Ok(());
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "rat service configuration was installed for data root {}, but its scheduler did not become ready within five seconds; the service configuration remains installed",
+                root.display()
+            );
+        }
+        thread::sleep(POLL_INTERVAL.min(remaining));
     }
 }
 
