@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
+use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
+use dialoguer::{Confirm, Select, theme::SimpleTheme};
 
 use crate::model::{Job, JobState, NewJob, Run, RunStatus};
 use crate::runner;
@@ -466,27 +470,98 @@ fn print_jobs(jobs: &[Job]) -> Result<()> {
 fn print_job(job: &Job) -> Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    writeln!(output, "Job {}", job.id)?;
-    writeln!(output, "State: {}", state_label(job.state))?;
     writeln!(
         output,
-        "Next at: {}",
-        job.next_at.map_or_else(|| "-".to_owned(), format_instant)
+        "{}",
+        JobDetails {
+            job,
+            sanitize: false,
+        }
     )?;
-    writeln!(output, "Timezone: {}", job.definition.schedule.timezone())?;
-    writeln!(output, "Schedule: {:?}", job.definition.schedule)?;
-    writeln!(
-        output,
-        "Working directory: {}",
-        job.definition.cwd.display()
-    )?;
-    writeln!(output, "PATH: {}", job.definition.path)?;
-    writeln!(output, "Command: {}", job.definition.command)?;
-    writeln!(output, "Environment:")?;
-    for (name, value) in &job.definition.env {
-        writeln!(output, "  {name}={value}")?;
-    }
     Ok(())
+}
+
+struct JobDetails<'a> {
+    job: &'a Job,
+    sanitize: bool,
+}
+
+impl Display for JobDetails<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let job = self.job;
+        writeln!(formatter, "Job {}", job.id)?;
+        writeln!(formatter, "State: {}", state_label(job.state))?;
+        writeln!(
+            formatter,
+            "Next at: {}",
+            job.next_at.map_or_else(|| "-".to_owned(), format_instant)
+        )?;
+        writeln!(
+            formatter,
+            "Timezone: {}",
+            JobDetailValue {
+                value: job.definition.schedule.timezone(),
+                sanitize: self.sanitize,
+            }
+        )?;
+        writeln!(formatter, "Schedule: {:?}", job.definition.schedule)?;
+        writeln!(
+            formatter,
+            "Working directory: {}",
+            JobDetailValue {
+                value: job.definition.cwd.display(),
+                sanitize: self.sanitize,
+            }
+        )?;
+        writeln!(
+            formatter,
+            "PATH: {}",
+            JobDetailValue {
+                value: job.definition.path.as_str(),
+                sanitize: self.sanitize,
+            }
+        )?;
+        writeln!(
+            formatter,
+            "Command: {}",
+            JobDetailValue {
+                value: job.definition.command.as_str(),
+                sanitize: self.sanitize,
+            }
+        )?;
+        write!(formatter, "Environment:")?;
+        for (name, value) in &job.definition.env {
+            write!(
+                formatter,
+                "\n  {}={}",
+                JobDetailValue {
+                    value: name.as_str(),
+                    sanitize: self.sanitize,
+                },
+                JobDetailValue {
+                    value: value.as_str(),
+                    sanitize: self.sanitize,
+                }
+            )?;
+        }
+        Ok(())
+    }
+}
+
+struct JobDetailValue<T> {
+    value: T,
+    sanitize: bool,
+}
+
+impl<T: Display> Display for JobDetailValue<T> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        if self.sanitize {
+            let rendered = self.value.to_string();
+            formatter.write_str(&safe_label(&rendered))
+        } else {
+            Display::fmt(&self.value, formatter)
+        }
+    }
 }
 
 fn print_history(runs: &[Run]) -> Result<()> {
@@ -575,52 +650,202 @@ fn write_output_file(path: &Path, stream: &str, output: &mut impl Write) -> Resu
     }
 }
 
+#[derive(Debug)]
+enum InteractiveChoice {
+    Add,
+    Refresh,
+    RunHistory,
+    Rat(Job),
+    At(crate::native::AtJob),
+    Cron {
+        job: crate::native::CronJob,
+        raw_line: String,
+    },
+    AtUnavailable(String),
+    CronUnavailable(String),
+    Quit,
+}
+
+#[derive(Debug)]
+struct InteractiveCancelled;
+
+impl std::fmt::Display for InteractiveCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("interactive action cancelled")
+    }
+}
+
+impl std::error::Error for InteractiveCancelled {}
+
 fn run_interactive(root: &Path) -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "no command was given and stdin/stdout are not terminals; use `rat list` for a non-interactive listing"
     );
+    let mut store = Store::open(root)?;
+    let stopping = Arc::new(AtomicBool::new(false));
+    let _signals = runner::SignalRegistrations::install(Arc::clone(&stopping))?;
+    loop {
+        if stopping.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let (choices, labels) = match interactive_choices(&store) {
+            Ok(choices) => choices,
+            Err(_) if stopping.load(Ordering::Relaxed) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if stopping.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let selected = match select_menu("Scheduled jobs", &labels, 0) {
+            Ok(selected) => selected,
+            Err(error) if error.is::<InteractiveCancelled>() => return Ok(()),
+            Err(_) if stopping.load(Ordering::Relaxed) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if stopping.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Some(selected) = selected else {
+            return Ok(());
+        };
+        let Some(choice) = choices.get(selected) else {
+            continue;
+        };
+        let result = match choice {
+            InteractiveChoice::Add => interactive_add_menu(root, &mut store),
+            InteractiveChoice::Refresh => Ok(()),
+            InteractiveChoice::RunHistory => interactive_output(root, &store, None),
+            InteractiveChoice::Rat(job) => interactive_rat_job(root, &mut store, job.id),
+            InteractiveChoice::At(job) => interactive_at_details(job),
+            InteractiveChoice::Cron { job, raw_line } => interactive_cron_details(job, raw_line),
+            InteractiveChoice::AtUnavailable(message) => {
+                print_interactive_message(&format!("at is unavailable: {message}"))
+            }
+            InteractiveChoice::CronUnavailable(message) => {
+                print_interactive_message(&format!("cron is unavailable: {message}"))
+            }
+            InteractiveChoice::Quit => return Ok(()),
+        };
+        if stopping.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if let Err(error) = result
+            && !error.is::<InteractiveCancelled>()
+        {
+            writeln!(
+                io::stderr().lock(),
+                "rat: {}",
+                terminal_text(&format!("{error:#}"))
+            )?;
+        }
+    }
+}
+
+fn interactive_choices(store: &Store) -> Result<(Vec<InteractiveChoice>, Vec<String>)> {
+    let mut choices = vec![
+        InteractiveChoice::Add,
+        InteractiveChoice::Refresh,
+        InteractiveChoice::RunHistory,
+    ];
+    let mut labels = vec![
+        "Add a job".to_owned(),
+        "Refresh".to_owned(),
+        "Run history (rat)".to_owned(),
+    ];
+    for job in store.jobs(false)? {
+        labels.push(safe_label(&format!(
+            "rat job #{}: [{}] next {}: {}",
+            job.id,
+            state_label(job.state),
+            job.next_at.map_or_else(|| "-".to_owned(), format_instant),
+            job.definition.command
+        )));
+        choices.push(InteractiveChoice::Rat(job));
+    }
+    match crate::native::list_at() {
+        Ok(jobs) => {
+            for job in jobs {
+                let label = if job.queue.is_empty() {
+                    format!("at job {}: {}", job.id, job.when)
+                } else {
+                    format!("at job {} (queue {}): {}", job.id, job.queue, job.when)
+                };
+                labels.push(safe_label(&label));
+                choices.push(InteractiveChoice::At(job));
+            }
+        }
+        Err(error) => {
+            labels.push(safe_label(&format!("at unavailable: {error:#}")));
+            choices.push(InteractiveChoice::AtUnavailable(format!("{error:#}")));
+        }
+    }
+    match crate::native::read_crontab() {
+        Ok(table) => {
+            for job in table.jobs {
+                let raw_line = original_crontab_line(&table.text, job.line)
+                    .unwrap_or("")
+                    .to_owned();
+                labels.push(safe_label(&format!(
+                    "cron line {}: {} {}",
+                    job.line, job.schedule, job.command
+                )));
+                choices.push(InteractiveChoice::Cron { job, raw_line });
+            }
+        }
+        Err(error) => {
+            labels.push(safe_label(&format!("cron unavailable: {error:#}")));
+            choices.push(InteractiveChoice::CronUnavailable(format!("{error:#}")));
+        }
+    }
+    labels.push("Quit".to_owned());
+    choices.push(InteractiveChoice::Quit);
+    Ok((choices, labels))
+}
+
+fn original_crontab_line(text: &str, line: usize) -> Option<&str> {
+    text.split('\n').nth(line.checked_sub(1)?)
+}
+
+fn interactive_add_menu(root: &Path, store: &mut Store) -> Result<()> {
+    let options = [
+        "One-off (at)".to_owned(),
+        "Recurring (cron)".to_owned(),
+        "rat scheduler".to_owned(),
+    ];
+    let Some(selected) = select_menu("Add a job", &options, 0)? else {
+        return Ok(());
+    };
+    match selected {
+        0 => interactive_add_at(),
+        1 => interactive_add_cron(),
+        2 => {
+            interactive_setup(root)?;
+            require_scheduler(root)?;
+            interactive_add(store)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn interactive_setup(root: &Path) -> Result<()> {
     if !interactive_setup_decided(root)? && !service::installed_for_root(root)? {
         let install = prompt_yes_no(
-            "First setup: install rat to start automatically at login? [y/N] ",
+            "First setup: install rat to start automatically at login?",
             false,
         )?;
         if install {
             service::install(root)?;
             record_interactive_setup_decision(root, true)?;
-            print_message("Installed rat's login service.")?;
+            print_interactive_message("Installed rat's login service.")?;
         } else {
             record_interactive_setup_decision(root, false)?;
-            print_message(
+            print_interactive_message(
                 "No service was installed. Start the scheduler manually with `rat daemon` when you want scheduled jobs to run.",
             )?;
         }
     }
-
-    let mut store = Store::open(root)?;
-    loop {
-        print_jobs(&store.jobs(false)?)?;
-        let input = prompt("rat> ")?;
-        let mut words = input.split_whitespace();
-        let Some(action) = words.next() else {
-            continue;
-        };
-        let arguments: Vec<&str> = words.collect();
-        if action == "quit" || action == "q" {
-            ensure!(arguments.is_empty(), "quit takes no arguments");
-            return Ok(());
-        }
-        if action == "help" {
-            print_message(
-                "Commands: add, show ID, edit ID, delete ID, pause ID, review ID, history [ID], output RUN_ID, quit",
-            )?;
-            continue;
-        }
-        let result = interactive_action(action, &arguments, root, &mut store);
-        if let Err(error) = result {
-            writeln!(io::stderr().lock(), "rat: {error:#}")?;
-        }
-    }
+    Ok(())
 }
 
 fn interactive_setup_decided(root: &Path) -> Result<bool> {
@@ -652,93 +877,307 @@ fn record_interactive_setup_decision(root: &Path, installed: bool) -> Result<()>
     })
 }
 
-fn interactive_action(
-    action: &str,
-    arguments: &[&str],
-    root: &Path,
-    store: &mut Store,
-) -> Result<()> {
+fn interactive_at_details(job: &crate::native::AtJob) -> Result<()> {
+    let script = crate::native::at_script(&job.id)?;
+    print_interactive_message(&format!(
+        "at job {}\nWhen: {}\nQueue: {}\nScript:\n{}",
+        safe_label(&job.id),
+        safe_label(&job.when),
+        if job.queue.is_empty() {
+            "not exposed by atq".to_owned()
+        } else {
+            safe_label(&job.queue)
+        },
+        terminal_text(&script)
+    ))?;
+    let _ = select_menu("at job details", &["Back".to_owned()], 0)?;
+    Ok(())
+}
+
+fn interactive_cron_details(job: &crate::native::CronJob, raw_line: &str) -> Result<()> {
+    print_interactive_message(&format!(
+        "Cron line {}\n{}",
+        job.line,
+        terminal_text(raw_line)
+    ))?;
+    let _ = select_menu("cron job details", &["Back".to_owned()], 0)?;
+    Ok(())
+}
+
+fn interactive_rat_job(root: &Path, store: &mut Store, id: i64) -> Result<()> {
+    let job = store.get(id)?;
+    let actions = vec![
+        "Details".to_owned(),
+        "Edit job".to_owned(),
+        match job.state {
+            JobState::Active => "Pause job",
+            JobState::Paused => "Resume job",
+            JobState::NeedsReview => "Review uncertain run",
+            JobState::Completed | JobState::Deleted => "Job unavailable",
+        }
+        .to_owned(),
+        "History".to_owned(),
+        "Output".to_owned(),
+        "Delete".to_owned(),
+        "Back".to_owned(),
+    ];
+    let Some(selected) = select_menu(&format!("rat job #{}", job.id), &actions, 0)? else {
+        return Err(InteractiveCancelled.into());
+    };
+    let action = actions.get(selected).map(String::as_str);
     match action {
-        "add" => {
-            ensure!(arguments.is_empty(), "interactive add takes no arguments");
-            require_scheduler(root)?;
-            interactive_add(store)
-        }
-        "show" => {
-            let id = one_id(arguments, "show")?;
-            print_job(&store.get(id)?)
-        }
-        "edit" => {
-            let id = one_id(arguments, "edit")?;
+        Some("Details") => print_interactive_job(&job),
+        Some("Edit job") => {
             require_scheduler(root)?;
             interactive_edit(store, id)
         }
-        "delete" => {
-            let id = one_id(arguments, "delete")?;
-            store.delete(id)?;
-            print_message(&format!(
-                "Deleted job {id}; an already-running command is not stopped."
-            ))
-        }
-        "pause" => {
-            let id = one_id(arguments, "pause")?;
+        Some("Pause job") => {
             store.pause(id)?;
             print_message(&format!("Paused job {id}."))
         }
-        "resume" => {
-            let id = one_id(arguments, "resume")?;
+        Some("Resume job") => {
             require_scheduler(root)?;
             let now = Utc::now();
-            let job = store.get(id)?;
             let overdue_one_off = job.state == JobState::Paused
                 && matches!(job.definition.schedule, Schedule::OneOff { at, .. } if at <= now);
             let confirm = if overdue_one_off {
-                let accepted = prompt_yes_no(
-                    "This one-off is overdue and will run immediately. Resume it? [y/N] ",
+                prompt_yes_no(
+                    "This one-off is overdue and will run immediately. Resume it?",
                     false,
-                )?;
-                ensure!(accepted, "overdue one-off resume was not confirmed");
-                true
+                )?
             } else {
                 false
             };
-            store.resume(id, now, confirm)?;
-            print_message(&format!("Resumed job {id}."))
+            if overdue_one_off && !confirm {
+                print_message("Resume cancelled.")
+            } else {
+                store.resume(id, now, confirm)?;
+                print_message(&format!("Resumed job {id}."))
+            }
         }
-        "review" => {
-            let id = one_id(arguments, "review")?;
-            let confirm = prompt_yes_no(
-                "Acknowledge the uncertain occurrence without replaying it? [y/N] ",
+        Some("Review uncertain run") => {
+            if prompt_yes_no(
+                "Acknowledge the uncertain occurrence without replaying it?",
                 false,
-            )?;
-            ensure!(confirm, "review was not acknowledged");
-            store.resolve(id, Utc::now())?;
-            print_message(&format!(
-                "Acknowledged the uncertain occurrence for job {id}; it will not be replayed."
-            ))
+            )? {
+                store.resolve(id, Utc::now())?;
+                print_message(&format!(
+                    "Acknowledged the uncertain occurrence for job {id}; it will not be replayed."
+                ))
+            } else {
+                print_message("Review cancelled.")
+            }
         }
-        "history" => {
-            ensure!(arguments.len() <= 1, "history accepts at most one job ID");
-            let id = arguments.first().map(|value| value.parse()).transpose()?;
-            let mut runs = store.history(id)?;
+        Some("History") => {
+            let mut runs = store.history(Some(id))?;
             runs.sort_by_key(|run| run.id);
             print_history(&runs)
         }
-        "output" => {
-            let run_id = one_id(arguments, "output")?;
-            print_output(root, run_id)
+        Some("Output") => interactive_output(root, store, Some(id)),
+        Some("Delete") => {
+            if prompt_yes_no(
+                &format!("Delete job {id}? An already-running command will not be stopped."),
+                false,
+            )? {
+                store.delete(id)?;
+                print_message(&format!(
+                    "Deleted job {id}; an already-running command is not stopped."
+                ))
+            } else {
+                print_message("Delete cancelled.")
+            }
         }
-        _ => bail!("unknown interactive command {action:?}; type `help` for commands"),
+        _ => Ok(()),
     }
 }
 
-fn one_id(arguments: &[&str], action: &str) -> Result<i64> {
-    ensure!(arguments.len() == 1, "{action} requires exactly one job ID");
-    arguments[0]
-        .parse()
-        .with_context(|| format!("invalid job ID {:?}", arguments[0]))
+fn interactive_output(root: &Path, store: &Store, job_id: Option<i64>) -> Result<()> {
+    let mut runs = store.history(job_id)?;
+    runs.sort_by_key(|run| run.id);
+    if runs.is_empty() {
+        let message = if job_id.is_some() {
+            "No run output is available for this job."
+        } else {
+            "No rat run history is available."
+        };
+        print_interactive_message(message)?;
+        return Ok(());
+    }
+    let labels = runs
+        .iter()
+        .map(|run| {
+            safe_label(&format!(
+                "rat run #{} from job #{} [{}] scheduled {}: {}",
+                run.id,
+                run.job_id,
+                run_status_label(run.status),
+                format_instant(run.scheduled_at),
+                run.definition.command
+            ))
+        })
+        .collect::<Vec<_>>();
+    let Some(selected) = select_menu("Select run output", &labels, labels.len() - 1)? else {
+        return Err(InteractiveCancelled.into());
+    };
+    if let Some(run) = runs.get(selected) {
+        print_output(root, run.id)?;
+    }
+    Ok(())
 }
 
+fn print_interactive_job(job: &Job) -> Result<()> {
+    let details = JobDetails {
+        job,
+        sanitize: true,
+    };
+    let details = if job.definition.env.is_empty() {
+        format!("{details}\n")
+    } else {
+        format!("{details}")
+    };
+    print_interactive_message(&details)
+}
+
+fn select_menu(prompt: &str, items: &[String], default: usize) -> Result<Option<usize>> {
+    let theme = SimpleTheme;
+    let terminal = dialoguer::console::Term::stdout();
+    let result = Select::with_theme(&theme)
+        .with_prompt(safe_label(prompt))
+        .items(items)
+        .clear(false)
+        .default(default)
+        .interact_on_opt(&terminal);
+    terminal.show_cursor()?;
+    result.map_err(dialoguer_error)
+}
+
+fn dialoguer_error(error: dialoguer::Error) -> anyhow::Error {
+    match error {
+        dialoguer::Error::IO(error) if error.kind() == io::ErrorKind::Interrupted => {
+            InteractiveCancelled.into()
+        }
+        error @ dialoguer::Error::IO(_) => error.into(),
+    }
+}
+
+fn safe_label(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() && character != '\n' && character != '\t' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn print_interactive_message(message: &str) -> Result<()> {
+    print_message(&terminal_text(message))
+}
+
+fn interactive_add_at() -> Result<()> {
+    let when = prompt("One-off time tokens (for example 2h 5m or 20270101T090000Z): ")?;
+    let tokens = when
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    ensure!(!tokens.is_empty(), "one-off time is required");
+    let default_zone = default_timezone()?;
+    let timezone = prompt(&format!("IANA timezone [{default_zone}]: "))?;
+    let timezone = if timezone.is_empty() {
+        default_zone
+    } else {
+        validate_timezone(timezone)?
+    };
+    let command = prompt("Command string (one shell command): ")?;
+    validate_command(&command)?;
+    print_interactive_message(&format!(
+        "Native at preview: time {when:?} in {timezone}; command {command:?}\nNative at uses minute precision and rounds up. Its OS scheduler must be enabled; rat will not start it."
+    ))?;
+    if !prompt_yes_no("Register native at job?", false)? {
+        print_interactive_message("Add cancelled.")?;
+        return Ok(());
+    }
+    let schedule = schedule::parse_one_off(&tokens, Utc::now(), &timezone)?;
+    let Schedule::OneOff { at, .. } = schedule else {
+        bail!("one-off parser returned a recurring schedule")
+    };
+    let diagnostics = crate::native::add_at(at, &command)?;
+    if diagnostics.trim().is_empty() {
+        print_interactive_message("at registration command completed without diagnostics.")?;
+    } else {
+        print_interactive_message(&format!("at reports (UTC):\n{diagnostics}"))?;
+    }
+    Ok(())
+}
+
+fn interactive_add_cron() -> Result<()> {
+    let expected = crate::native::read_crontab()?.text;
+    let cron = read_native_cron_schedule()?;
+    schedule::parse_recurring(&cron, "UTC")?;
+    let command = prompt("Command string (one shell command): ")?;
+    validate_command(&command)?;
+    print_interactive_message(&format!(
+        "Native cron preview: schedule {cron:?}; command {command:?}\nUses the crontab environment and OS scheduler timezone. rat will not start cron or capture run output."
+    ))?;
+    if !prompt_yes_no("Register native cron job?", false)? {
+        print_interactive_message("Add cancelled.")?;
+        return Ok(());
+    }
+    crate::native::add_cron(&expected, &cron, &command)?;
+    print_interactive_message("Crontab entry registered; execution is managed by cron.")
+}
+
+fn read_native_cron_schedule() -> Result<String> {
+    let choices = [
+        "Daily".to_owned(),
+        "Weekly".to_owned(),
+        "Monthly".to_owned(),
+        "Custom cron".to_owned(),
+    ];
+    let selected = select_menu("Recurring cron schedule", &choices, 0)?
+        .ok_or_else(|| anyhow::Error::new(InteractiveCancelled))?;
+    match selected {
+        0 => {
+            let (minute, hour) = read_calendar_time()?;
+            Ok(format!("{minute} {hour} * * *"))
+        }
+        1 => {
+            let (minute, hour) = read_calendar_time()?;
+            let days = prompt("Weekdays (Mon, Tue, Wed, Thu, Fri, Sat, Sun; comma separated): ")?;
+            let cron_days = days
+                .split(',')
+                .map(str::trim)
+                .map(weekday_number)
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(!cron_days.is_empty(), "select at least one weekday");
+            Ok(format!("{minute} {hour} * * {}", cron_days.join(",")))
+        }
+        2 => {
+            let (minute, hour) = read_calendar_time()?;
+            let day: u8 = prompt("Day of month (1-31): ")?
+                .parse()
+                .context("day of month must be an integer from 1 to 31")?;
+            ensure!((1..=31).contains(&day), "day of month must be from 1 to 31");
+            Ok(format!("{minute} {hour} {day} * *"))
+        }
+        3 => prompt("Cron schedule (five fields): "),
+        _ => bail!("invalid recurring schedule choice"),
+    }
+}
 fn interactive_add(store: &mut Store) -> Result<()> {
     let default_zone = default_timezone()?;
     let schedule = read_schedule(&default_zone)?;
@@ -746,7 +1185,7 @@ fn interactive_add(store: &mut Store) -> Result<()> {
     validate_command(&command)?;
     let env = read_environment()?;
     let confirmation = format!(
-        "Add command {:?}, schedule {:?}, timezone {}, and environment {:?}? [y/N] ",
+        "Add command {:?}, schedule {:?}, timezone {}, and environment {:?}?",
         command, schedule.expression, schedule.timezone, env
     );
     if !prompt_yes_no(&confirmation, false)? {
@@ -764,7 +1203,7 @@ fn interactive_add(store: &mut Store) -> Result<()> {
 
 fn interactive_edit(store: &mut Store, id: i64) -> Result<()> {
     let existing = store.get(id)?;
-    let replace_schedule = prompt_yes_no("Replace the schedule? [y/N] ", false)?;
+    let replace_schedule = prompt_yes_no("Replace the schedule?", false)?;
     let schedule = if replace_schedule {
         Some(read_schedule(existing.definition.schedule.timezone())?)
     } else {
@@ -780,8 +1219,7 @@ fn interactive_edit(store: &mut Store, id: i64) -> Result<()> {
         validate_command(&command_input)?;
         command_input
     };
-    let replace_environment =
-        prompt_yes_no("Replace explicit environment variables? [y/N] ", false)?;
+    let replace_environment = prompt_yes_no("Replace explicit environment variables?", false)?;
     let env = if replace_environment {
         read_environment()?
     } else {
@@ -802,7 +1240,7 @@ fn interactive_edit(store: &mut Store, id: i64) -> Result<()> {
         |draft| draft.timezone.as_str(),
     );
     let confirmation = format!(
-        "Save job {id} with command {command:?}, schedule {schedule_preview}, timezone {timezone_preview}, and environment {env:?}? [y/N] "
+        "Save job {id} with command {command:?}, schedule {schedule_preview}, timezone {timezone_preview}, and environment {env:?}?"
     );
     if !prompt_yes_no(&confirmation, false)? {
         print_message("Edit cancelled.")?;
@@ -924,7 +1362,9 @@ fn weekday_number(day: &str) -> Result<String> {
 }
 
 fn read_environment() -> Result<BTreeMap<String, String>> {
-    print_message("Enter KEY=VALUE environment entries; submit an empty line when finished.")?;
+    print_interactive_message(
+        "Enter KEY=VALUE environment entries; submit an empty line when finished.",
+    )?;
     let mut values = Vec::new();
     loop {
         let value = prompt("env> ")?;
@@ -936,27 +1376,109 @@ fn read_environment() -> Result<BTreeMap<String, String>> {
     parse_environment(values)
 }
 
-fn prompt(message: &str) -> Result<String> {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    write!(output, "{message}")?;
-    output.flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    if input.is_empty() {
-        bail!("input ended while waiting for a response")
+struct TerminalEchoGuard {
+    fd: std::os::fd::RawFd,
+    original: libc::termios,
+}
+
+impl TerminalEchoGuard {
+    fn disable() -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let stdin = io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: stdin is an open terminal and `original` is a valid output buffer.
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error()).context("cannot read terminal echo settings");
+        }
+        // SAFETY: tcgetattr initialized `original` successfully.
+        let original = unsafe { original.assume_init() };
+        let mut no_echo = original;
+        no_echo.c_lflag &= !libc::ECHO;
+        // SAFETY: `fd` is stdin and `no_echo` is a fully initialized terminal settings value.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const no_echo) } == -1 {
+            return Err(io::Error::last_os_error()).context("cannot disable terminal echo");
+        }
+        Ok(Self { fd, original })
     }
-    Ok(input.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: `fd` is the open stdin descriptor and `original` was read from it.
+        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original) };
+    }
+}
+
+fn prompt(message: &str) -> Result<String> {
+    let mut terminal = dialoguer::console::Term::stdout();
+    let echo = TerminalEchoGuard::disable()?;
+    let result = (|| {
+        ensure!(terminal.is_term(), "input requires a terminal");
+        write!(terminal, "{}", safe_label(message))?;
+        terminal.flush()?;
+        let mut input = String::new();
+        loop {
+            let key = match terminal.read_key_raw() {
+                Ok(key) => key,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    terminal.write_line("")?;
+                    return Err(InteractiveCancelled.into());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match key {
+                dialoguer::console::Key::Char('\u{4}')
+                | dialoguer::console::Key::CtrlC
+                | dialoguer::console::Key::Escape => {
+                    terminal.write_line("")?;
+                    return Err(InteractiveCancelled.into());
+                }
+                dialoguer::console::Key::Char(character) if !character.is_control() => {
+                    input.push(character);
+                    write!(terminal, "{character}")?;
+                    terminal.flush()?;
+                }
+                dialoguer::console::Key::Backspace => {
+                    if let Some(character) = input.pop() {
+                        let width =
+                            dialoguer::console::measure_text_width(&character.to_string()).max(1);
+                        for _ in 0..width {
+                            write!(terminal, "\x08")?;
+                        }
+                        for _ in 0..width {
+                            write!(terminal, " ")?;
+                        }
+                        for _ in 0..width {
+                            write!(terminal, "\x08")?;
+                        }
+                        terminal.flush()?;
+                    }
+                }
+                dialoguer::console::Key::Enter => {
+                    terminal.write_line("")?;
+                    return Ok(input);
+                }
+                _ => {}
+            }
+        }
+    })();
+    drop(echo);
+    terminal.show_cursor()?;
+    result
 }
 
 fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
-    let answer = prompt(message)?;
-    if answer.is_empty() {
-        return Ok(default);
-    }
-    match answer.to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => bail!("answer yes or no"),
-    }
+    let theme = SimpleTheme;
+    let terminal = dialoguer::console::Term::stdout();
+    let result = Confirm::with_theme(&theme)
+        .with_prompt(safe_label(message))
+        .default(default)
+        .wait_for_newline(true)
+        .interact_on_opt(&terminal);
+    terminal.show_cursor()?;
+    result
+        .map_err(dialoguer_error)?
+        .ok_or_else(|| InteractiveCancelled.into())
 }

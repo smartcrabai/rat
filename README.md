@@ -1,6 +1,6 @@
 # rat
 
-rat is a single-user tool for scheduling local shell commands. It targets macOS and Linux and manages one-shot and calendar-based recurring schedules as Jobs.
+rat is a single-user macOS/Linux tool for viewing native at/cron schedules and adding shell jobs from a keyboard-operated list. It also manages its own one-shot and calendar-based schedules as Jobs.
 
 ## Install
 
@@ -32,9 +32,19 @@ cargo install --path .
 
 ## Use and start
 
-Starting `rat` opens the job list, where you can view job details, edit or delete jobs, and add jobs. `rat list` displays the list without an interactive interface. Jobs can also be paused and resumed from the list or the non-interactive CLI.
+Run `rat` in a terminal to see native at jobs, crontab entries, and rat-managed jobs in one list. Use the arrow keys and Enter to select a row or **Add a job**. Escape or Ctrl-C cancels the current form or exits the main list. **Refresh** reloads the queues.
 
-Before using these examples, either run `rat service install` or start `rat daemon` in another terminal:
+Choose where a new job is registered:
+
+- **One-off (at)**: register with the OS at queue. Relative times are resolved after confirmation. Native at has minute precision; seconds round up rather than running early. Registration diagnostics are labelled UTC.
+- **Recurring (cron)**: choose daily, weekly, monthly, or a custom five-field expression. The job uses the crontab's shell and environment, the OS scheduler timezone, and its normal working directory; use absolute paths when needed.
+- **rat scheduler**: keep rat-managed scheduling, saved command context, run history, and captured output.
+
+Existing native entries have read-only details. They are not imported into rat's database and do not acquire rat's pause/recovery/history guarantees. Comments, environment settings, and existing crontab entries are preserved when adding a cron job. Detected concurrent changes abort registration; the native crontab install API cannot exclude a simultaneous external editor.
+
+Native features require the OS commands `at`, `atq`, and `crontab`, plus the corresponding enabled OS schedulers. Missing or denied commands appear as unavailable sources without hiding rat jobs. rat never installs or starts native scheduler daemons; successful registration alone does not mean they are running.
+
+The non-interactive subcommands manage rat jobs only. Before using these examples, either run `rat service install` or start `rat daemon` in another terminal:
 
 ```sh
 rat add 2h 5m -- 'printf "hello\n"'
@@ -43,13 +53,15 @@ rat add --cron '0 9 * * 1-5' --timezone Asia/Tokyo -- 'date'
 
 Everything after `--` is treated as one command string interpreted by the shell. Arguments are not reconstructed after shell expansion.
 
-rat saves and manages job definitions and determines when they run. The OS is used to start rat's scheduler when the user logs in; it is not used to register individual jobs. `at` and `cron` are not runtime dependencies. The scheduler continues running after the terminal is closed and resumes after login, but execution while logged out and waking hardware from sleep are not guaranteed.
+For rat-managed Jobs, rat saves definitions and determines when they run. The OS only starts rat's scheduler when the user logs in; individual rat Jobs are not registered with at/cron, and those tools are not runtime dependencies of rat's scheduler. The scheduler continues running after the terminal is closed and resumes after login, but execution while logged out and waking hardware from sleep are not guaranteed.
 
-During initial interactive setup, rat asks before configuring automatic startup at login. macOS uses launchd; Linux uses systemd --user. On Linux without systemd --user, the scheduler can be started manually. The non-interactive CLI never silently configures a persistent service. If required setup is missing, it returns an error with explicit guidance.
+When choosing **rat scheduler** for the first time, rat asks before configuring automatic startup at login if needed. Merely opening the list or adding native jobs never asks to install rat's service. macOS uses launchd; Linux uses systemd --user. On Linux without systemd --user, the scheduler can be started manually. The non-interactive CLI never silently configures a persistent service. If required setup is missing, it returns an error with explicit guidance.
+
+Service installation waits up to five seconds after activation for the scheduler to become ready. If startup does not complete, it reports an error and leaves the consented service configuration installed.
 
 `rat add`, `rat edit`, and `rat resume` require a scheduler that is actually running. The presence of an automatic-start configuration alone is not enough. Check or remove the service with `rat service status` and `rat service uninstall`. The manually started `rat daemon` runs in the foreground. Use the service for login-time startup independent of a terminal.
 
-A Job is a scheduled command; a Run is one execution of a Job. Job IDs and Run IDs are distinct. Common non-interactive commands:
+For rat-managed schedules, a Job is a definition and a Run is one execution. Job IDs and Run IDs are distinct. Common non-interactive commands:
 
 ```sh
 rat list --all --json
@@ -63,11 +75,11 @@ rat output 1
 rat delete 1
 ```
 
-The numeric arguments to `show`, `edit`, `pause`, `resume`, `review`, `history`, and `delete` are Job IDs. The numeric argument to `output` is a Run ID. `review --acknowledge` marks an uncertain scheduled occurrence as reviewed without replaying it. `--confirm-overdue` explicitly consents to immediately running an overdue one-shot Job. The interactive interface also describes commands through `help`; use `history` and `output` to inspect Runs and their results.
+The numeric arguments to `show`, `edit`, `pause`, `resume`, `review`, `history`, and `delete` are Job IDs. The numeric argument to `output` is a Run ID. `review --acknowledge` marks an uncertain scheduled occurrence as reviewed without replaying it. `--confirm-overdue` explicitly consents to immediately running an overdue one-shot Job. In the selection interface, **Run history (rat)** gives access to captured output, including Runs whose Jobs have completed or been deleted.
 
-Data is stored in this order of preference: `RAT_HOME`, `XDG_DATA_HOME/rat`, then `HOME/.local/share/rat`. The directory is accessible only to the user. Job definitions and Run history are stored in SQLite, and output is stored in separate files.
+Rat-managed data is stored in this order of preference: `RAT_HOME`, `XDG_DATA_HOME/rat`, then `HOME/.local/share/rat`. The directory is accessible only to the user. Job definitions and Run history are stored in SQLite, and output is stored in separate files.
 
-## Schedules
+## Rat-managed schedules
 
 ### One-shot
 
@@ -137,4 +149,4 @@ Quint checks scheduling uniqueness, overlap skips, pause and resume, recovery fr
 
 ## Out of scope
 
-Canceling or forcibly terminating running commands, notifications, importing existing `at` or `crontab` jobs, remote execution, Windows, and multi-user administration are out of scope. Full syntax compatibility with existing commands is not a goal.
+Canceling or forcibly terminating running commands, notifications, importing native at/crontab jobs into rat's scheduler, remote execution, Windows, and multi-user administration are out of scope. Full syntax compatibility with existing commands is not a goal.

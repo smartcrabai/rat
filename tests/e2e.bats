@@ -14,6 +14,7 @@ setup() {
   export TZ=UTC
   cd "$TEST_CWD"
 
+  RAT_SERVICE_DAEMON_PID_FILE="$TEST_ROOT/service-daemon.pid"
   RAT_DAEMON_PID=""
   RAT_OWNED_CHILD_PID=""
   RAT_LAST_RUN_ID=""
@@ -21,6 +22,7 @@ setup() {
 
 teardown() {
   stop_daemon
+  stop_service_daemon
   cleanup_command_child
   rm -rf "$TEST_ROOT"
 }
@@ -57,6 +59,21 @@ stop_daemon() {
     fi
     wait "$RAT_DAEMON_PID" 2>/dev/null || true
     RAT_DAEMON_PID=""
+  fi
+}
+
+stop_service_daemon() {
+  local pid attempt
+  [[ -s "$RAT_SERVICE_DAEMON_PID_FILE" ]] || return 0
+  pid="$(cat "$RAT_SERVICE_DAEMON_PID_FILE")"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for attempt in {1..50}; do
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
   fi
 }
 
@@ -165,6 +182,202 @@ wait_for_file() {
 
 line_count() {
   python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); print(len(p.read_text().splitlines()) if p.exists() else 0)' "$1"
+}
+
+ui_session() {
+  python3 - "$RAT_BIN" "$RAT_HOME" "$TEST_ROOT" "$@" <<'PY'
+import errno
+import fcntl
+import os
+import pty
+import select
+import re
+import signal
+import struct
+import sys
+import termios
+import time
+from pathlib import Path
+
+binary, rat_home_name, test_root_name, *steps = sys.argv[1:]
+test_root = Path(test_root_name)
+ui_home = test_root / "ui-home"
+ui_home.mkdir(exist_ok=True)
+native_bin = test_root / "ui-native-bin"
+native_bin.mkdir(exist_ok=True)
+native_tools = {
+    "at": '#!/bin/sh\nif [ "$1" = "-l" ]; then exit 0; fi\nexit 1\n',
+    "atq": '#!/bin/sh\nexit 0\n',
+    "crontab": '#!/bin/sh\nif [ "$1" = "-l" ]; then printf "no crontab for %s\\n" "$(id -un)" >&2; exit 1; fi\nexit 1\n',
+    "launchctl": '#!/bin/sh\nexit 1\n',
+    "systemctl": '#!/bin/sh\nexit 1\n',
+}
+for name, script in native_tools.items():
+    tool = native_bin / name
+    tool.write_text(script)
+    tool.chmod(0o700)
+env = os.environ.copy()
+env.update(
+    RAT_BIN=binary,
+    RAT_HOME=rat_home_name,
+    HOME=str(ui_home),
+    XDG_CONFIG_HOME=str(ui_home / "config"),
+    TERM="xterm-256color",
+    PATH=f"{native_bin}{os.pathsep}{os.environ['PATH']}",
+)
+for step in steps:
+    if step.startswith("env:"):
+        name, _, value = step[4:].partition("=")
+        env[name] = value
+service_bin = env.pop("RAT_TEST_SERVICE_BIN", None)
+if service_bin:
+    env["PATH"] = f"{service_bin}{os.pathsep}{env['PATH']}"
+
+pid, master = pty.fork()
+if pid == 0:
+    try:
+        os.chdir(test_root)
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+        os.execve(binary, [binary], env)
+    except OSError as error:
+        os.write(2, f"could not exec rat: {error}\n".encode())
+        os._exit(127)
+fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+os.set_blocking(master, False)
+transcript = bytearray()
+cursor = 0
+finished = None
+
+def poll():
+    global finished
+    if finished is not None:
+        return finished
+    child, status = os.waitpid(pid, os.WNOHANG)
+    if child:
+        finished = os.waitstatus_to_exitcode(status)
+    return finished
+
+def drain_available():
+    while select.select([master], [], [], 0)[0]:
+        try:
+            chunk = os.read(master, 4096)
+        except BlockingIOError:
+            return
+        except OSError as error:
+            if error.errno == errno.EIO:
+                return
+            raise
+        if not chunk:
+            return
+        transcript.extend(chunk)
+
+def wait_for_exit(expected):
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        drain_available()
+        status = poll()
+        if status is not None:
+            drain_available()
+            if status != expected:
+                raise AssertionError(f"rat exited with status {status}, expected {expected}")
+            return status
+        ready, _, _ = select.select([master], [], [], 0.05)
+        if ready:
+            drain_available()
+    raise AssertionError(f"rat did not exit with status {expected}")
+
+def assert_terminal_restored():
+    if not (termios.tcgetattr(master)[3] & termios.ECHO):
+        raise AssertionError("terminal ECHO was not restored")
+    visible = True
+    for state in re.findall(rb"\x1b\[\?25([hl])", transcript):
+        visible = state == b"h"
+    if not visible:
+        raise AssertionError("terminal cursor was not visible at exit")
+
+def read_until(expected):
+    global cursor
+    expected = expected.encode()
+    deadline = time.monotonic() + 8
+    while expected not in transcript[cursor:]:
+        if poll() is not None:
+            raise AssertionError(f"rat exited before {expected!r}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {expected!r}")
+        ready, _, _ = select.select([master], [], [], remaining)
+        if not ready:
+            raise AssertionError(f"timed out waiting for {expected!r}")
+        try:
+            chunk = os.read(master, 4096)
+        except BlockingIOError:
+            continue
+        except OSError as error:
+            if error.errno == errno.EIO:
+                raise AssertionError(f"rat closed the PTY before {expected!r}") from error
+            raise
+        if not chunk:
+            raise AssertionError(f"rat closed the PTY before {expected!r}")
+        transcript.extend(chunk)
+    cursor = transcript.find(expected, cursor) + len(expected)
+
+def send_key(key, count=1):
+    keys = {"ENTER": b"\r", "DOWN": b"\x1b[B", "ESC": b"\x1b", "CTRL_C": b"\x03"}
+    for _ in range(count):
+        os.write(master, keys[key])
+
+expected_exit = None
+try:
+    for step in steps:
+        kind, _, value = step.partition(":")
+        if kind == "env":
+            continue
+        if kind == "expect":
+            read_until(value)
+        elif kind == "key":
+            key, separator, count = value.partition("*")
+            send_key(key, int(count) if separator else 1)
+        elif kind == "text":
+            os.write(master, value.encode())
+        elif kind == "signal" and value == "INT":
+            os.kill(pid, signal.SIGINT)
+        elif kind == "normal-exit":
+            expected_exit = wait_for_exit(0)
+            assert_terminal_restored()
+    if expected_exit is None and poll() is not None:
+        raise AssertionError("rat exited during the interactive flow")
+except Exception:
+    print(transcript.decode(errors="replace"), file=sys.stderr)
+    raise
+finally:
+    # macOS can block child exit until its PTY master is drained or closed.
+    os.close(master)
+    if poll() is None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if poll() is None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
+        while poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if poll() is None:
+            raise AssertionError("rat did not exit after SIGKILL")
+
+print(transcript.decode(errors="replace"), end="")
+PY
+}
+
+job_row_downs() {
+  "$RAT_BIN" list --all --json | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d if isinstance(d,list) else next((d[k] for k in ("jobs","items","data") if isinstance(d,dict) and isinstance(d.get(k),list)), None); assert isinstance(rows,list), "expected a job list"; wanted=sys.argv[1]; matches=[i for i,j in enumerate(rows) if str(j.get("id"))==wanted]; assert len(matches)==1, f"expected one row for job {wanted}, found {len(matches)}"; print(3+matches[0])' "$1"
 }
 
 @test "offline add gives manual-daemon guidance and registers nothing" {
@@ -429,180 +642,287 @@ line_count() {
   cleanup_command_child
 }
 
-@test "first interactive setup asks once after list created the database and records decline" {
-  python3 - "$RAT_BIN" "$RAT_HOME" "$TEST_ROOT" <<'PY'
-import errno
-import os
-import pty
-import select
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-binary, root_name, test_root_name = sys.argv[1:]
-root = Path(root_name)
-test_root = Path(test_root_name)
-home = test_root / "isolated-home"
-home.mkdir()
-config_home = home / "config"
-env = os.environ.copy()
-env.update(RAT_HOME=str(root), HOME=str(home), XDG_CONFIG_HOME=str(config_home))
-
-listed = subprocess.run(
-    [binary, "list", "--json"],
-    cwd=test_root,
-    env=env,
-    capture_output=True,
-    text=True,
-    timeout=5,
-)
-assert listed.returncode == 0, listed.stderr
-assert any(path.is_file() for path in root.iterdir()), "list did not create the database"
-decision = root / ".first-interactive-setup"
-assert not decision.exists()
-
-def start_ui():
-    master, slave = pty.openpty()
-    process = subprocess.Popen(
-        [binary], cwd=test_root, env=env, stdin=slave, stdout=slave, stderr=slave
-    )
-    os.close(slave)
-    return process, master
-
-def read_until(process, master, expected):
-    deadline = time.monotonic() + 8
-    output = bytearray()
-    while expected not in output:
-        if process.poll() is not None:
-            raise AssertionError(f"rat exited before {expected!r}: {output!r}")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise AssertionError(f"timed out waiting for {expected!r}: {output!r}")
-        ready, _, _ = select.select([master], [], [], remaining)
-        if not ready:
-            raise AssertionError(f"timed out waiting for {expected!r}: {output!r}")
-        try:
-            chunk = os.read(master, 4096)
-        except OSError as error:
-            if error.errno == errno.EIO:
-                raise AssertionError(f"rat closed the PTY before {expected!r}") from error
-            raise
-        output.extend(chunk)
-    return bytes(output)
-
-def stop_ui(process, master):
-    if process.poll() is None:
-        process.kill()
-    process.wait(timeout=5)
-    os.close(master)
-
-process, master = start_ui()
-try:
-    prompt = read_until(
-        process,
-        master,
-        b"First setup: install rat to start automatically at login? [y/N] ",
-    )
-    assert b"First setup:" in prompt
-    os.write(master, b"n\n")
-    read_until(process, master, b"rat> ")
-    os.write(master, b"q\n")
-    assert process.wait(timeout=5) == 0
-finally:
-    stop_ui(process, master)
-
-assert decision.read_text() == "declined\n"
-assert not (home / "Library/LaunchAgents/io.github.smartcrabai.rat.plist").exists()
-assert not (config_home / "systemd/user/rat.service").exists()
-assert not (home / ".config/systemd/user/rat.service").exists()
-
-process, master = start_ui()
-try:
-    startup = read_until(process, master, b"rat> ")
-    assert b"First setup:" not in startup
-    os.write(master, b"q\n")
-    assert process.wait(timeout=5) == 0
-finally:
-    stop_ui(process, master)
-PY
+@test "interactive startup does not install a service" {
+  local ui_home="$TEST_ROOT/ui-home"
+  run ui_session 'expect:Add a job' 'expect:Quit'
+  [ "$status" -eq 0 ]
+  [ ! -e "$ui_home/Library/LaunchAgents/io.github.smartcrabai.rat.plist" ]
+  [ ! -e "$ui_home/config/systemd/user/rat.service" ]
+  [ ! -e "$ui_home/.config/systemd/user/rat.service" ]
 }
 
-@test "interactive help and output command show captured run output" {
+@test "Ctrl-C at the main menu exits normally and restores the terminal" {
+  run ui_session 'expect:Add a job' 'signal:INT' 'normal-exit'
+  [ "$status" -eq 0 ]
+}
+
+@test "Ctrl-C in an interactive text field cancels to the list and restores echo" {
+  start_daemon
+  local command ready_id before_jobs before_history
+  command='printf should-not-be-added'
+  ready_id="$(job_id_for_command ': rat-e2e-readiness')"
+  before_jobs="$("$RAT_BIN" list --all --json)"
+  before_history="$("$RAT_BIN" history "$ready_id" --json)"
+
+  run ui_session \
+    'expect:Add a job' \
+    'key:ENTER' \
+    'expect:One-off (at)' \
+    'key:DOWN*2' \
+    'key:ENTER' \
+    'expect:First setup: install rat to start automatically at login?' \
+    'key:ENTER' \
+    'expect:Schedule [oneoff/daily/weekly/monthly]:' \
+    'text:oneoff' \
+    'key:ENTER' \
+    'expect:One-off time tokens (for example 2h 5m or 20270101T090000Z):' \
+    'text:2h' \
+    'key:ENTER' \
+    'expect:IANA timezone [' \
+    'key:ENTER' \
+    'expect:Command string (one shell command):' \
+    "text:$command" \
+    'key:CTRL_C' \
+    'expect:Add a job' \
+    'key:ESC' \
+    'normal-exit'
+  [ "$status" -eq 0 ]
+  [ "$("$RAT_BIN" list --all --json)" = "$before_jobs" ]
+  [ "$("$RAT_BIN" history "$ready_id" --json)" = "$before_history" ]
+}
+
+@test "cancelling an interactive rat add leaves jobs and history unchanged" {
+  start_daemon
+  local command ready_id before_jobs before_history
+  command='true'
+  ready_id="$(job_id_for_command ': rat-e2e-readiness')"
+  before_jobs="$("$RAT_BIN" list --all --json)"
+  before_history="$("$RAT_BIN" history "$ready_id" --json)"
+
+  run ui_session \
+    'expect:Add a job' \
+    'key:ENTER' \
+    'expect:One-off (at)' \
+    'key:DOWN*2' \
+    'key:ENTER' \
+    'expect:First setup: install rat to start automatically at login?' \
+    'key:ENTER' \
+    'expect:Schedule [oneoff/daily/weekly/monthly]:' \
+    'text:oneoff' \
+    'key:ENTER' \
+    'expect:One-off time tokens (for example 2h 5m or 20270101T090000Z):' \
+    'text:2h' \
+    'key:ENTER' \
+    'expect:IANA timezone [' \
+    'key:ENTER' \
+    'expect:Command string (one shell command):' \
+    "text:$command" \
+    'key:ENTER' \
+    'expect:env>' \
+    'key:ENTER' \
+    'expect:Add command' \
+    'text:n' \
+    'key:ENTER' \
+    'expect:Add a job'
+  [ "$status" -eq 0 ]
+  [ "$("$RAT_BIN" list --all --json)" = "$before_jobs" ]
+  [ "$("$RAT_BIN" history "$ready_id" --json)" = "$before_history" ]
+}
+
+@test "interactive rat addition persists and runs through the live daemon" {
+  start_daemon
+  local command marker job_id
+  marker="$TEST_ROOT/interactive-added.marker"
+  command="printf interactive-added-token > '$marker'"
+
+  run ui_session \
+    'expect:Add a job' \
+    'key:ENTER' \
+    'expect:One-off (at)' \
+    'key:DOWN*2' \
+    'key:ENTER' \
+    'expect:First setup: install rat to start automatically at login?' \
+    'key:ENTER' \
+    'expect:Schedule [oneoff/daily/weekly/monthly]:' \
+    'text:oneoff' \
+    'key:ENTER' \
+    'expect:One-off time tokens (for example 2h 5m or 20270101T090000Z):' \
+    'text:0' \
+    'key:ENTER' \
+    'expect:IANA timezone [' \
+    'key:ENTER' \
+    'expect:Command string (one shell command):' \
+    "text:$command" \
+    'key:ENTER' \
+    'expect:env>' \
+    'key:ENTER' \
+    'expect:Add command' \
+    'text:y' \
+    'key:ENTER' \
+    'expect:Add a job'
+  [ "$status" -eq 0 ]
+
+  job_id="$(job_id_for_command "$command")"
+  wait_for_file "$marker"
+  wait_for_history_status "$job_id" succeeded
+  [ "$(cat "$marker")" = "interactive-added-token" ]
+}
+
+@test "interactive first install waits for a real daemon before scheduling" {
+  case "$(uname -s)" in
+    Linux|Darwin) ;;
+    *) skip "isolated service-manager readiness regression applies to Linux and macOS" ;;
+  esac
+  local service_bin="$TEST_ROOT/fake-service-bin"
+  local marker="$TEST_ROOT/first-install.marker"
+  local command job_id unit_path
+  command="printf first-install-token > '$marker'"
+  mkdir -p "$service_bin"
+
+  cat >"$service_bin/start-rat-daemon" <<'SH'
+#!/bin/sh
+exec python3 - "$RAT_BIN" "$RAT_TEST_DAEMON_PID_FILE" "$RAT_TEST_DAEMON_LOG" "$RAT_TEST_DAEMON_DELAY" <<'PY'
+import os
+import subprocess
+import sys
+
+binary, pid_file, log_file, delay = sys.argv[1:]
+launcher = "import os,sys,time; time.sleep(float(sys.argv[1])); os.execv(sys.argv[2], [sys.argv[2], 'daemon'])"
+with open(log_file, "ab", buffering=0) as output:
+    daemon = subprocess.Popen(
+        [sys.executable, "-c", launcher, delay, binary],
+        env=os.environ.copy(),
+        stdin=subprocess.DEVNULL,
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+with open(pid_file, "w", encoding="ascii") as tracked:
+    tracked.write(f"{daemon.pid}\n")
+PY
+SH
+  chmod +x "$service_bin/start-rat-daemon"
+
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    cat >"$service_bin/systemctl" <<'SH'
+#!/bin/sh
+case "$*" in
+  "--user show-environment") exit 0 ;;
+  "--user show rat.service --property=FragmentPath --value") exit 0 ;;
+  "--user is-active --quiet rat.service") exit 1 ;;
+  "--user daemon-reload") exit 0 ;;
+  "--user enable --now rat.service") "$(dirname "$0")/start-rat-daemon" ;;
+  *) exit 1 ;;
+esac
+SH
+    unit_path="$TEST_ROOT/ui-home/config/systemd/user/rat.service"
+  else
+    cat >"$service_bin/launchctl" <<'SH'
+#!/bin/sh
+case "$1" in
+  print) exit 1 ;;
+  bootstrap) "$(dirname "$0")/start-rat-daemon" ;;
+  *) exit 1 ;;
+esac
+SH
+    unit_path="$TEST_ROOT/ui-home/Library/LaunchAgents/io.github.smartcrabai.rat.plist"
+  fi
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    chmod +x "$service_bin/systemctl"
+  else
+    chmod +x "$service_bin/launchctl"
+  fi
+
+  run ui_session \
+    "env:RAT_TEST_SERVICE_BIN=$service_bin" \
+    "env:RAT_TEST_DAEMON_PID_FILE=$RAT_SERVICE_DAEMON_PID_FILE" \
+    "env:RAT_TEST_DAEMON_LOG=$TEST_ROOT/service-daemon.log" \
+    'env:RAT_TEST_DAEMON_DELAY=1.0' \
+    'expect:Add a job' \
+    'key:ENTER' \
+    'expect:One-off (at)' \
+    'key:DOWN*2' \
+    'key:ENTER' \
+    'expect:First setup: install rat to start automatically at login?' \
+    'text:y' \
+    'key:ENTER' \
+    "expect:Installed rat's login service." \
+    'expect:Schedule [oneoff/daily/weekly/monthly]:' \
+    'text:oneoff' \
+    'key:ENTER' \
+    'expect:One-off time tokens (for example 2h 5m or 20270101T090000Z):' \
+    'text:0' \
+    'key:ENTER' \
+    'expect:IANA timezone [' \
+    'key:ENTER' \
+    'expect:Command string (one shell command):' \
+    "text:$command" \
+    'key:ENTER' \
+    'expect:env>' \
+    'key:ENTER' \
+    'expect:Add command' \
+    'text:y' \
+    'key:ENTER' \
+    'expect:Add a job' \
+    'key:ESC' \
+    'normal-exit'
+  [ "$status" -eq 0 ]
+  [ -e "$unit_path" ]
+  [ -s "$RAT_SERVICE_DAEMON_PID_FILE" ]
+
+  job_id="$(job_id_for_command "$command")"
+  [ "$(job_field "$job_id" command)" = "$command" ]
+  wait_for_file "$marker"
+  wait_for_history_status "$job_id" succeeded
+  [ "$(cat "$marker")" = "first-install-token" ]
+}
+
+@test "selecting and pausing a rat row updates persisted state" {
+  start_daemon
+  local command job_id row_downs initial_state
+  command='true'
+  run "$RAT_BIN" add 86400 -- "$command"
+  [ "$status" -eq 0 ]
+  job_id="$(job_id_for_command "$command")"
+  row_downs="$(job_row_downs "$job_id")"
+  initial_state="$(job_field "$job_id" state | tr '[:upper:]' '[:lower:]' | tr -d '_-')"
+  [ "$initial_state" != "paused" ]
+
+  run ui_session \
+    'expect:Add a job' \
+    "expect:rat job #$job_id" \
+    "key:DOWN*$row_downs" \
+    'key:ENTER' \
+    'expect:Pause job' \
+    'key:DOWN*2' \
+    'key:ENTER' \
+    'expect:Add a job'
+  [ "$status" -eq 0 ]
+  [ "$(job_field "$job_id" state | tr '[:upper:]' '[:lower:]' | tr -d '_-')" = "paused" ]
+}
+
+@test "run history selection shows captured output from a real run" {
   start_daemon
   local command job_id run_id
-  command='printf interactive-output-token'
+  command='printf "selected-%s" output-token'
   run "$RAT_BIN" add 0 -- "$command"
   [ "$status" -eq 0 ]
   job_id="$(job_id_for_command "$command")"
   wait_for_history_status "$job_id" succeeded
   run_id="$RAT_LAST_RUN_ID"
-  printf 'declined\n' >"$RAT_HOME/.first-interactive-setup"
 
-  python3 - "$RAT_BIN" "$RAT_HOME" "$TEST_ROOT" "$run_id" <<'PY'
-import errno
-import os
-import pty
-import select
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-binary, root_name, test_root_name, run_id = sys.argv[1:]
-root = Path(root_name)
-test_root = Path(test_root_name)
-home = test_root / "interactive-home"
-home.mkdir()
-env = os.environ.copy()
-env.update(
-    RAT_HOME=str(root),
-    HOME=str(home),
-    XDG_CONFIG_HOME=str(home / "config"),
-)
-master, slave = pty.openpty()
-process = subprocess.Popen(
-    [binary], cwd=test_root, env=env, stdin=slave, stdout=slave, stderr=slave
-)
-os.close(slave)
-
-def read_until(expected):
-    deadline = time.monotonic() + 8
-    output = bytearray()
-    while expected not in output:
-        if process.poll() is not None:
-            raise AssertionError(f"rat exited before {expected!r}: {output!r}")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise AssertionError(f"timed out waiting for {expected!r}: {output!r}")
-        ready, _, _ = select.select([master], [], [], remaining)
-        if not ready:
-            raise AssertionError(f"timed out waiting for {expected!r}: {output!r}")
-        try:
-            output.extend(os.read(master, 4096))
-        except OSError as error:
-            if error.errno == errno.EIO:
-                raise AssertionError(f"rat closed the PTY before {expected!r}") from error
-            raise
-    return bytes(output)
-
-try:
-    read_until(b"rat> ")
-    os.write(master, b"help\n")
-    help_output = read_until(b"rat> ")
-    assert b"output RUN_ID" in help_output
-    os.write(master, f"output {run_id}\n".encode())
-    output = read_until(b"rat> ")
-    assert b"interactive-output-token" in output
-    assert b"unknown interactive command" not in output
-    os.write(master, b"q\n")
-    assert process.wait(timeout=5) == 0
-finally:
-    if process.poll() is None:
-        process.kill()
-    process.wait(timeout=5)
-    os.close(master)
-PY
+  run ui_session \
+    'expect:Add a job' \
+    'expect:Run history (rat)' \
+    'key:DOWN*2' \
+    'key:ENTER' \
+    'expect:Select run output' \
+    "expect:run #$run_id" \
+    'key:ENTER' \
+    'expect:stdout:' \
+    'expect:selected-output-token'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"selected-output-token"* ]]
 }
 
 @test "add requires a live scheduler even when a LaunchAgent reports loaded" {

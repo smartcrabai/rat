@@ -29,6 +29,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 croner = "4"
+dialoguer = { version = "0.12.0", default-features = false }
 iana-time-zone = "0.1"
 libc = "0.2"
 rusqlite = { version = "0.41", features = ["bundled"] }
