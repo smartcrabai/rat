@@ -1376,12 +1376,12 @@ fn read_environment() -> Result<BTreeMap<String, String>> {
     parse_environment(values)
 }
 
-struct TerminalEchoGuard {
+struct PromptTerminalGuard {
     fd: std::os::fd::RawFd,
     original: libc::termios,
 }
 
-impl TerminalEchoGuard {
+impl PromptTerminalGuard {
     fn disable() -> Result<Self> {
         use std::os::fd::AsRawFd;
 
@@ -1394,17 +1394,20 @@ impl TerminalEchoGuard {
         }
         // SAFETY: tcgetattr initialized `original` successfully.
         let original = unsafe { original.assume_init() };
-        let mut no_echo = original;
-        no_echo.c_lflag &= !libc::ECHO;
-        // SAFETY: `fd` is stdin and `no_echo` is a fully initialized terminal settings value.
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const no_echo) } == -1 {
-            return Err(io::Error::last_os_error()).context("cannot disable terminal echo");
+        let mut prompt_mode = original;
+        prompt_mode.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN);
+        prompt_mode.c_cc[libc::VMIN] = 1;
+        prompt_mode.c_cc[libc::VTIME] = 0;
+        // SAFETY: `fd` is stdin and `prompt_mode` is a fully initialized terminal settings value.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const prompt_mode) } == -1 {
+            return Err(io::Error::last_os_error())
+                .context("cannot configure prompt terminal mode");
         }
         Ok(Self { fd, original })
     }
 }
 
-impl Drop for TerminalEchoGuard {
+impl Drop for PromptTerminalGuard {
     fn drop(&mut self) {
         // SAFETY: `fd` is the open stdin descriptor and `original` was read from it.
         let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original) };
@@ -1413,7 +1416,7 @@ impl Drop for TerminalEchoGuard {
 
 fn prompt(message: &str) -> Result<String> {
     let mut terminal = dialoguer::console::Term::stdout();
-    let echo = TerminalEchoGuard::disable()?;
+    let terminal_guard = PromptTerminalGuard::disable()?;
     let result = (|| {
         ensure!(terminal.is_term(), "input requires a terminal");
         write!(terminal, "{}", safe_label(message))?;
@@ -1464,7 +1467,7 @@ fn prompt(message: &str) -> Result<String> {
             }
         }
     })();
-    drop(echo);
+    drop(terminal_guard);
     terminal.show_cursor()?;
     result
 }
