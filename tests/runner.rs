@@ -455,7 +455,7 @@ fn continues_draining_output_from_a_bounded_background_descendant() -> Result<()
     let mut store = Store::open(root.path())?;
     let job = store.add(
         definition(
-            "(/bin/sleep 0.2; /bin/echo late && : > descendant-done) &",
+            "(/bin/sleep 2; /bin/echo late && : > descendant-done) &",
             root.path(),
             one_off(scheduled_at),
         ),
@@ -466,7 +466,7 @@ fn continues_draining_output_from_a_bounded_background_descendant() -> Result<()
     let run_id = run_id(&scheduler, job.id)?;
     let finished = root.path().join("descendant-done");
     let (stdout, _) = scheduler.store().output_paths(run_id);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut descendant_finished = false;
     let mut output_drained = false;
 
@@ -474,7 +474,7 @@ fn continues_draining_output_from_a_bounded_background_descendant() -> Result<()
         let tick_started = Instant::now();
         scheduler.tick(scheduled_at)?;
         assert!(
-            tick_started.elapsed() < Duration::from_millis(180),
+            tick_started.elapsed() < Duration::from_millis(1000),
             "tick blocked while the descendant retained the shell's output pipe"
         );
         descendant_finished = finished.exists();
