@@ -2,7 +2,9 @@
   extends: [
     "config:best-practices"
   ],
-  dependencyDashboard: false,
+  dependencyDashboard: {
+    enabled: false,
+  },
   minimumReleaseAge: "3 days",
   lockFileMaintenance: {
     minimumReleaseAge: null,
