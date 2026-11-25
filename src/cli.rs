@@ -1395,7 +1395,12 @@ impl TerminalEchoGuard {
         // SAFETY: tcgetattr initialized `original` successfully.
         let original = unsafe { original.assume_init() };
         let mut no_echo = original;
-        no_echo.c_lflag &= !libc::ECHO;
+        // Also disable canonical mode and signal generation so a Ctrl-C byte is
+        // always delivered as data (Key::CtrlC), even between console's per-key
+        // raw-mode toggles.
+        no_echo.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+        no_echo.c_cc[libc::VMIN] = 1;
+        no_echo.c_cc[libc::VTIME] = 0;
         // SAFETY: `fd` is stdin and `no_echo` is a fully initialized terminal settings value.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const no_echo) } == -1 {
             return Err(io::Error::last_os_error()).context("cannot disable terminal echo");
