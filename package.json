@@ -8,6 +8,6 @@
     "verify": "quint verify spec/scheduler.qnt --backend=tlc --invariant=schedulerSafety --max-steps=12"
   },
   "devDependencies": {
-    "@informalsystems/quint": "0.33.1"
+    "@informalsystems/quint": "0.34.0"
   }
 }
